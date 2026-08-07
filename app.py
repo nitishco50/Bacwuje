@@ -1,40 +1,219 @@
-# app.py - Production Ready for Render.com
+# app.py - Ultra Lightweight for Render Free Tier
 import os
 import re
 import json
+import time
 import random
 import logging
-import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-import yt_dlp
+
+# yt-dlp OPTIONAL hai — agar install nahi hua toh bhi crash nahi hoga
+try:
+    import yt_dlp
+    HAS_YTDLP = True
+except ImportError:
+    HAS_YTDLP = False
 
 # ─── Configuration ──────────────────────────────────────────────
-CONFIG = {
-    "DB_PATH": os.environ.get("CACHE_DB_PATH", "cache.db"),
-    "CACHE_TTL_HOURS": int(os.environ.get("CACHE_TTL_HOURS", 6)),
-    "RATE_LIMIT": os.environ.get("RATE_LIMIT", "30/minute"),
-    "REQUEST_TIMEOUT": int(os.environ.get("REQUEST_TIMEOUT", 15)),
-    # Add proxies via environment variable (comma-separated) or leave empty
-    "PROXY_LIST": [p.strip() for p in os.environ.get("PROXY_LIST", "").split(",") if p.strip()],
-    "USER_AGENTS": [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
-        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/125.0.0.0 Mobile Safari/537.36",
-    ]
-}
+PORT = int(os.environ.get("PORT", 5000))
+CACHE_TTL = int(os.environ.get("CACHE_TTL_SECONDS", 21600))  # 6 hours
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT", 30))           # requests per minute
+TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", 15))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ─── In-Memory Cache (Lightweight, no SQLite) ──────────────────
+cache = {}
+
+def cache_get(shortcode):
+    entry = cache.get(shortcode)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > CACHE_TTL:
+        del cache[shortcode]
+        return None
+    result = dict(entry["data"])
+    result["from_cache"] = True
+    return result
+
+def cache_set(shortcode, data):
+    # Limit cache size to 500 entries (memory protection)
+    if len(cache) >= 500:
+        oldest = min(cache, key=lambda k: cache[k]["ts"])
+        del cache[oldest]
+    cache[shortcode] = {"data": data, "ts": time.time()}
+
+# ─── Simple In-Memory Rate Limiter ─────────────────────────────
+rate_store = {}
+
+def is_rate_limited(ip):
+    now = time.time()
+    if ip not in rate_store:
+        rate_store[ip] = []
+    # Clean old entries (older than 60s)
+    rate_store[ip] = [t for t in rate_store[ip] if now - t < 60]
+    if len(rate_store[ip]) >= RATE_LIMIT:
+        return True
+    rate_store[ip].append(now)
+    return False
+
+# ─── Helpers ───────────────────────────────────────────────────
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+    }
+
+def extract_shortcode(url):
+    patterns = [
+        r'instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)',
+        r'instagr\.am/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)',
+    ]
+    for p in patterns:
+        m = re.search(p, url.strip())
+        if m:
+            return m.group(1)
+    return None
+
+# ─── Engine 1: Regex Scraper (No BeautifulSoup needed) ─────────
+def scrape_embed(shortcode):
+    try:
+        url = f"https://www.instagram.com/p/{shortcode}/embed/"
+        resp = requests.get(url, headers=get_headers(), timeout=TIMEOUT)
+        if resp.status_code != 200:
+            return None
+
+        html = resp.text
+
+        # Find video_url via regex
+        m = re.search(r'"video_url"\s*:\s*"([^"]+)"', html)
+        if not m:
+            # Try direct video tag
+            m = re.search(r'<video[^>]+src="([^"]+)"', html)
+            if not m:
+                return None
+
+        video_url = m.group(1).replace("\\u002F", "/").replace("&amp;", "&")
+
+        result = {"video_url": video_url, "method": "embed"}
+
+        # Optional metadata
+        thumb = re.search(r'"poster_url"\s*:\s*"([^"]+)"', html)
+        if thumb:
+            result["thumbnail"] = thumb.group(1).replace("\\u002F", "/")
+
+        author = re.search(r'"username"\s*:\s*"([^"]+)"', html)
+        if author:
+            result["author"] = author.group(1)
+
+        return result
+    except Exception as e:
+        logger.warning(f"Embed failed for {shortcode}: {e}")
+        return None
+
+# ─── Engine 2: yt-dlp (Optional Fallback) ──────────────────────
+def scrape_ytdlp(shortcode):
+    if not HAS_YTDLP:
+        return None
+    try:
+        url = f"https://www.instagram.com/reel/{shortcode}/"
+        opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "socket_timeout": TIMEOUT,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return None
+
+        video_url = info.get("url")
+        formats = info.get("formats", [])
+        vids = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+        if vids:
+            best = max(vids, key=lambda f: f.get("tbr") or 0)
+            video_url = best["url"]
+
+        return {
+            "video_url": video_url,
+            "thumbnail": info.get("thumbnail"),
+            "author": info.get("uploader") or info.get("channel"),
+            "duration": info.get("duration"),
+            "method": "ytdlp",
+        } if video_url else None
+    except Exception as e:
+        logger.warning(f"yt-dlp failed for {shortcode}: {e}")
+        return None
+
+# ─── Unified Handler ───────────────────────────────────────────
+def get_video_data(shortcode):
+    cached = cache_get(shortcode)
+    if cached:
+        return cached
+
+    result = scrape_embed(shortcode)
+    if not result:
+        result = scrape_ytdlp(shortcode)
+
+    if result:
+        result["shortcode"] = shortcode
+        cache_set(shortcode, result)
+        return result
+    return None
+
+# ─── Flask App ──────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app)
+
+@app.before_request
+def check_rate_limit():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    if is_rate_limited(ip):
+        return jsonify({"success": False, "error": "Too many requests. Try again later."}), 429
+
+@app.route("/api/download", methods=["POST"])
+def download():
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "").strip()
+    if not url:
+        return jsonify({"success": False, "error": "URL required"}), 400
+
+    shortcode = extract_shortcode(url)
+    if not shortcode:
+        return jsonify({"success": False, "error": "Invalid Instagram URL"}), 400
+
+    result = get_video_data(shortcode)
+    if not result:
+        return jsonify({"success": False, "error": "Video not found. Post may be private or deleted."}), 422
+
+    return jsonify({"success": True, **result}), 200
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "ytdlp": HAS_YTDLP,
+        "cache_size": len(cache),
+        "time": datetime.now().isoformat()
+    })
+
+# ─── Entry Point ────────────────────────────────────────────────
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT, debug=False)    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
