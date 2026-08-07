@@ -1,40 +1,268 @@
-"""
-MediaGrabber - Universal Social Media Downloader API
-Supports YouTube, Instagram, TikTok, Snapchat, Facebook
-Powered by FastAPI & yt-dlp
-"""
-
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, HttpUrl
-from typing import List, Optional, Dict, Any
-import time
+# app.py - Production Grade Instagram Video Downloader
 import re
 import os
-import urllib.parse
+import json
+import time
+import sqlite3
+import hashlib
+import logging
+from datetime import datetime, timedelta
+from functools import wraps
 
-app = FastAPI(
-    title="MediaGrabber API",
-    description="Backend API for downloading videos and audio from YouTube, Instagram, TikTok, Snapchat, and Facebook",
-    version="1.0.0"
-)
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import yt_dlp
 
-# Enable CORS for mobile app requests
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ─── Configuration ──────────────────────────────────────────────
+CONFIG = {
+    "DB_PATH": "cache.db",
+    "CACHE_TTL_HOURS": 6,
+    "RATE_LIMIT": "30/minute",       # Per IP limit
+    "REQUEST_TIMEOUT": 15,
+    "PROXY_LIST": [                  # Add your proxies here
+        # "http://user:pass@proxy1:port",
+        # "http://user:pass@proxy2:port",
+    ],
+    "USER_AGENTS": [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
+    ]
+}
 
-# Server Stats & Admin Metrics
-stats = {
-    "total_requests": 0,
-    "successful_extractions": 0,
-    "failed_extractions": 0,
-    "downloads_served": 0,
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ─── Database Cache Layer ───────────────────────────────────────
+class CacheDB:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    shortcode TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON cache(created_at)")
+
+    def get(self, shortcode):
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT data, created_at FROM cache WHERE shortcode = ?", (shortcode,)
+            ).fetchone()
+        if not row:
+            return None
+        data, created_at = row
+        created = datetime.fromisoformat(created_at)
+        if datetime.now() - created > timedelta(hours=CONFIG["CACHE_TTL_HOURS"]):
+            self.delete(shortcode)
+            return None
+        return json.loads(data)
+
+    def set(self, shortcode, data):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO cache (shortcode, data) VALUES (?, ?)",
+                (shortcode, json.dumps(data))
+            )
+
+    def delete(self, shortcode):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM cache WHERE shortcode = ?", (shortcode,))
+
+    def cleanup_expired(self):
+        cutoff = datetime.now() - timedelta(hours=CONFIG["CACHE_TTL_HOURS"])
+        with sqlite3.connect(self.db_path) as conn:
+            deleted = conn.execute(
+                "DELETE FROM cache WHERE created_at < ?", (cutoff.isoformat(),)
+            ).rowcount
+        logger.info(f"Cleaned {deleted} expired cache entries")
+
+
+cache = CacheDB(CONFIG["DB_PATH"])
+
+# ─── Proxy & Header Rotation ───────────────────────────────────
+def get_headers():
+    import random
+    return {
+        "User-Agent": random.choice(CONFIG["USER_AGENTS"]),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+def get_proxy():
+    import random
+    if CONFIG["PROXY_LIST"]:
+        return {"http": random.choice(CONFIG["PROXY_LIST"]),
+                "https": random.choice(CONFIG["PROXY_LIST"])}
+    return None
+
+# ─── Shortcode Extractor ───────────────────────────────────────
+def extract_shortcode(url):
+    patterns = [
+        r'instagram\.com/(?:p|reel|tv)/([A-Za-z0-9_-]+)',
+        r'instagr\.am/(?:p|reel|tv)/([A-Za-z0-9_-]+)',
+        r'instagram\.com/share/(?:r|p)/([A-Za-z0-9_-]+)',
+    ]
+    for p in patterns:
+        m = re.search(p, url.strip())
+        if m:
+            return m.group(1)
+    return None
+
+# ─── Engine 1: Embed Scraper (FAST) ────────────────────────────
+def scrape_embed(shortcode):
+    """Fast primary method using /embed/ endpoint."""
+    try:
+        embed_url = f"https://www.instagram.com/p/{shortcode}/embed/"
+        resp = requests.get(embed_url, headers=get_headers(),
+                          proxies=get_proxy(), timeout=CONFIG["REQUEST_TIMEOUT"])
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Direct video tag
+        video_tag = soup.find("video")
+        if video_tag and video_tag.get("src"):
+            return {"video_url": video_tag["src"], "method": "embed_direct"}
+
+        # Embedded JSON config
+        for script in soup.find_all("script", type="text/javascript"):
+            text = script.string or ""
+            match = re.search(r'"video_url"\s*:\s*"([^"]+)"', text)
+            if match:
+                url = match.group(1).replace("\\u002F", "/")
+                return {"video_url": url, "method": "embed_json"}
+
+            # Try to extract metadata too
+            meta_match = re.search(r'"caption"\s*:\s*\{"text"\s*:\s*"([^"]*)"', text)
+            thumbnail_match = re.search(r'"poster_url"\s*:\s*"([^"]+)"', text)
+
+        return None
+    except Exception as e:
+        logger.warning(f"Embed scraper failed for {shortcode}: {e}")
+        return None
+
+# ─── Engine 2: yt-dlp (RELIABLE FALLBACK) ──────────────────────
+def scrape_ytdlp(shortcode):
+    """Reliable fallback using yt-dlp library."""
+    try:
+        url = f"https://www.instagram.com/reel/{shortcode}/"
+        ydl_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "no_warnings": True,
+            "extract_flat": False,
+            "socket_timeout": CONFIG["REQUEST_TIMEOUT"],
+        }
+        if CONFIG["PROXY_LIST"]:
+            import random
+            ydl_opts["proxy"] = random.choice(CONFIG["PROXY_LIST"])
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        if not info:
+            return None
+
+        result = {
+            "video_url": info.get("url"),
+            "thumbnail": info.get("thumbnail"),
+            "title": info.get("title") or info.get("description", "")[:200],
+            "author": info.get("uploader") or info.get("channel"),
+            "duration": info.get("duration"),
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "method": "ytdlp",
+        }
+
+        # Get best quality video URL if multiple formats
+        formats = info.get("formats", [])
+        video_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+        if video_formats:
+            best = max(video_formats, key=lambda f: f.get("filesize") or f.get("tbr") or 0)
+            result["video_url"] = best["url"]
+            result["resolution"] = f"{best.get('width', '?')}x{best.get('height', '?')}"
+
+        return result if result["video_url"] else None
+
+    except Exception as e:
+        logger.error(f"yt-dlp failed for {shortcode}: {e}")
+        return None
+
+# ─── Unified Download Handler ──────────────────────────────────
+def get_video_data(shortcode):
+    """Try cache → embed → yt-dlp in order."""
+    # 1. Check cache first
+    cached = cache.get(shortcode)
+    if cached:
+        logger.info(f"Cache HIT for {shortcode}")
+        cached["from_cache"] = True
+        return cached
+
+    # 2. Fast embed scraper
+    logger.info(f"Trying embed scraper for {shortcode}")
+    result = scrape_embed(shortcode)
+
+    # 3. Fallback to yt-dlp
+    if not result:
+        logger.info(f"Embed failed, falling back to yt-dlp for {shortcode}")
+        result = scrape_ytdlp(shortcode)
+
+    if result:
+        result["shortcode"] = shortcode
+        result["fetched_at"] = datetime.now().isoformat()
+        cache.set(shortcode, result)
+        logger.info(f"Success for {shortcode} via {result.get('method')}")
+        return result
+
+    return None
+
+# ─── Flask App ──────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app)
+limiter = Limiter(key_func=get_remote_address, app=app, default_limits=[CONFIG["RATE_LIMIT"]])
+
+@app.route("/api/download", methods=["POST"])
+def download():
+    data = request.get_json(silent=True)
+    if not data or not data.get("url"):
+        return jsonify({"success": False, "error": "URL field is required"}), 400
+
+    shortcode = extract_shortcode(data["url"])
+    if not shortcode:
+        return jsonify({"success": False, "error": "Invalid Instagram URL. Supported: /reel/, /p/, /tv/"}), 400
+
+    result = get_video_data(shortcode)
+    if not result:
+        return jsonify({
+            "success": False,
+            "error": "Could not extract video. Post may be private, deleted, or region-restricted."
+        }), 422
+
+    return jsonify({"success": True, **result}), 200
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "timestamp": datetime.now().isoformat()})
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({"success": False, "error": "Too many requests. Please wait before trying again."}), 429
+
+if __name__ == "__main__":
+    # Auto-cleanup on startup
+    cache.cleanup_expired()
+    app.run(host="0.0.0.0", port=5000, debug=False)    "downloads_served": 0,
     "bandwidth_bytes": 0,
     "start_time": time.time(),
     "platform_counts": {
